@@ -172,28 +172,45 @@ def forward1(
     if return_legacy_cache:
         next_cache = next_cache.to_legacy_cache()
 
+    def compute_structural_loss(residual_stream, layer_idx=10, k=3, gamma=1.0, l=5):
+        """
+        Compute the structural auxiliary loss over a range of layers up to `layer_idx`.
+
+        Args:
+            residual_stream (List[Tensor]): list of residual tensors per layer, each of shape (B, d)
+            layer_idx (int): which layer to select residual from (inclusive)
+            k (int): how many top singular values to keep
+            gamma (float): loss weight
+            l (int): how many previous layers (including current) to use
+
+        Returns:
+            aux_loss (Tensor): scalar loss value
+        """
+        # Sanity check
+        start_idx = max(layer_idx - l + 1, 0)
+
+        # Ensure keys are sorted integers (if residual_stream is a dict)
+        selected = [residual_stream[i].float() for i in range(start_idx, layer_idx + 1)]
+
+        # Concatenate residuals from selected layers along batch dimension
+        R = torch.cat(selected, dim=0)  # shape: (B * l, d)
+
+        # Step 1: Center
+        R_centered = R - R.mean(dim=0, keepdim=True)
+
+        # Step 2: SVD
+        _, S, _ = torch.linalg.svd(R_centered, full_matrices=False)
+
+        # Step 3: Loss
+        S_squared = S ** 2
+        loss = -gamma * (S_squared[:k].sum() / S_squared.sum())
+
+        return loss
+
+
+
     # [!]
-    r10 = residual_stream[10].float()  # (batch_size, hidden_dim)
-
-    # === Step 1: 计算 batch 内的 PC3 单位向量 ===
-    # 先对 batch 的残差去均值
-    r10_centered = r10 - r10.mean(dim=0, keepdim=True)  # shape: (B, D)
-
-    # 做 PCA（SVD）找主成分方向
-    # U: (B, B), S: (min(B,D),), Vh: (D, D)
-    _, _, Vh = torch.linalg.svd(r10_centered, full_matrices=False)
-    pc3 = Vh[2]  # 第三个主成分方向 (D,)
-
-    # === Step 2: 每个样本在 PC3 上的投影 ===
-    proj_pc3 = torch.matmul(r10, pc3)  # (B,)
-
-    # === Step 3: 控制在 PC3 上的能量不要超过 batch 均值 ===
-    # 计算 PC3 能量和其 batch 均值
-    proj_squared = proj_pc3 ** 2  # (B,)
-    mean_proj_squared = proj_squared.mean()
-
-    # 损失项：惩罚超过平均值的部分
-    aux_loss = torch.mean(torch.relu(proj_squared - mean_proj_squared))
+    aux_loss = compute_structural_loss(residual_stream)
     # [!]
 
     return BaseModelOutputWithResidualStream(
